@@ -1,0 +1,258 @@
+import cv2
+import numpy as np
+import os
+import sys
+from insightface.app import FaceAnalysis
+from typing import List, Tuple, Optional
+
+# This class wraps face detection and recognition using InsightFace
+class FaceDetector:
+    # This method prepares the face detector with NVIDIA GPU support for your RTX 3050
+    def __init__(self, providers: List[str] | None = None) -> None:
+        # We prioritize CUDA (NVIDIA GPU) -> CoreML (Mac) -> CPU
+        if providers is None:
+            providers = ["CUDAExecutionProvider", "CoreMLExecutionProvider", "CPUExecutionProvider"]
+        
+        self.providers: List[str] = providers
+        # "buffalo_s" is chosen for its balance of speed and robustness (ArcFace + RetinaFace)
+        self.app: FaceAnalysis = FaceAnalysis(name="buffalo_s", providers=self.providers)
+        # We set det_size to (640, 640) for optimal real-time performance on a 3050
+        self.app.prepare(ctx_id=0, det_size=(640, 640))
+
+    # This method returns the FULL face objects (embeddings + boxes), not just coordinates
+    def detect_faces(self, frame):
+        # InsightFace expects RGB images
+        rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        # This detection step extracts the face embedding (identity vector) automatically
+        faces = self.app.get(rgb_frame)
+        return faces
+
+
+# This class handles the logic of WHO to blur based on identity
+class FaceBlurrer:
+    # This helper function calculates how similar two faces are (Cosine Similarity)
+    def _compute_sim(self, feat1, feat2):
+        return np.dot(feat1, feat2) / (np.linalg.norm(feat1) * np.linalg.norm(feat2))
+
+    # The main blurring logic with the Vlogger Exemption check
+    def blur_faces(self, frame, faces, enabled: bool, reference_embedding=None):
+        if not enabled:
+            return frame
+
+        height, width = frame.shape[:2]
+        output = frame.copy()
+
+        for face in faces:
+            # --- VLOGGER EXEMPTION LOGIC ---
+            # If we have a reference photo of the vlogger loaded...
+            if reference_embedding is not None:
+                # Calculate similarity score (0.0 to 1.0)
+                sim = self._compute_sim(face.embedding, reference_embedding)
+                
+                # Threshold: 0.5 is the standard verification limit for ArcFace.
+                # If score > 0.5, the system is confident it is YOU.
+                if sim > 0.5:
+                    # Draw a green box to indicate "Verified / Safe" (Optional, for visual feedback)
+                    box = face.bbox.astype(int)
+                    cv2.rectangle(output, (box[0], box[1]), (box[2], box[3]), (0, 255, 0), 2)
+                    cv2.putText(output, "VLOGGER", (box[0], box[1]-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+                    # SKIP BLURRING for this face
+                    continue 
+
+            # --- STANDARD BLURRING FOR BYSTANDERS ---
+            # Get integer coordinates
+            x1, y1, x2, y2 = face.bbox.astype(int)
+
+            # Clamp coordinates to ensure we don't crash at image edges
+            x1_clamped = max(0, min(x1, width - 1))
+            y1_clamped = max(0, min(y1, height - 1))
+            x2_clamped = max(0, min(x2, width))
+            y2_clamped = max(0, min(y2, height))
+
+            # Skip invalid boxes
+            if x2_clamped <= x1_clamped or y2_clamped <= y1_clamped:
+                continue
+
+            # Extract the face region
+            face_region = output[y1_clamped:y2_clamped, x1_clamped:x2_clamped]
+            
+            if face_region.size == 0:
+                continue
+
+            # Apply strong Gaussian Blur to destroy identity features
+            blurred_region = cv2.GaussianBlur(face_region, (51, 51), 0)
+            
+            # Put the blurred patch back into the image
+            output[y1_clamped:y2_clamped, x1_clamped:x2_clamped] = blurred_region
+
+        return output
+
+
+# This class controls the application flow, inputs, and recording
+class BlurApp:
+    def __init__(self, source_input, output_path: str) -> None:
+        self.source = source_input
+        self.output_path: str = output_path
+        
+        # Initialize Video Capture (handles both Webcam Index and File Path)
+        self.cap = cv2.VideoCapture(self.source)
+        if not self.cap.isOpened():
+            raise ValueError(f"Could not open video source: {self.source}")
+
+        self.blur_enabled: bool = True
+        self.detector: FaceDetector = FaceDetector()
+        self.blurrer: FaceBlurrer = FaceBlurrer()
+        self.writer = None
+        
+        # Variable to store the Vlogger's unique face embedding
+        self.my_embedding = None
+        
+        # Automatically try to learn the vlogger's face on startup
+        self._load_reference_face()
+    
+    # This loads 'me.jpg' and extracts the features so we know who NOT to blur
+    def _load_reference_face(self):
+        ref_path = "me.jpg"
+        if os.path.exists(ref_path):
+            print(f"Loading reference identity from {ref_path}...")
+            img = cv2.imread(ref_path)
+            if img is None:
+                print("Error: 'me.jpg' exists but could not be read.")
+                return
+            
+            # Detect faces in the reference image
+            faces = self.detector.detect_faces(img)
+            
+            if len(faces) > 0:
+                # We assume the largest face in 'me.jpg' is the vlogger
+                # Sorting by area (width * height)
+                largest_face = sorted(faces, key=lambda x: (x.bbox[2]-x.bbox[0]) * (x.bbox[3]-x.bbox[1]))[-1]
+                self.my_embedding = largest_face.embedding
+                print("SUCCESS: Vlogger identity loaded! You will remain visible.")
+            else:
+                print("WARNING: No face found in 'me.jpg'. Exemption mode is disabled.")
+        else:
+            print("NOTICE: No 'me.jpg' found. All faces will be blurred.")
+
+
+    # Initializes the video writer once we know the resolution of the stream
+    def _init_writer(self, frame) -> None:
+        height, width, _ = frame.shape
+        # Get FPS from source, or default to 30 if using a webcam
+        fps = self.cap.get(cv2.CAP_PROP_FPS)
+        if fps == 0 or fps is None: 
+            fps = 30.0
+        
+        # 'mp4v' is a standard codec for .mp4 files
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        self.writer = cv2.VideoWriter(self.output_path, fourcc, fps, (width, height))
+
+
+    # The main execution loop
+    def run(self) -> None:
+        print("--- APP RUNNING ---")
+        print("Controls: Press 'b' to toggle Privacy Mode | Press 'q' to Quit")
+        
+        while True:
+            ret, frame = self.cap.read()
+            if not ret:
+                break
+            
+            # Initialize writer on the first valid frame
+            if self.writer is None:
+                self._init_writer(frame)
+            
+            # Process the frame (Detect -> Verify Identity -> Blur)
+            processed = self._process_frame(frame)
+            
+            # Show the live feed
+            cv2.imshow("Privacy Cam (RTX 3050 Optimized)", processed)
+            
+            # Save the frame to disk
+            self._write_frame(processed)
+            
+            # Handle user inputs
+            key = cv2.waitKey(1) & 0xFF
+            if not self._handle_key(key):
+                break
+        
+        # Cleanup
+        self.cap.release()
+        if self.writer is not None:
+            self.writer.release()
+        cv2.destroyAllWindows()
+
+
+    def _write_frame(self, frame) -> None:
+        if self.writer is not None:
+            self.writer.write(frame)
+    
+    def _process_frame(self, frame):
+        # 1. Detect all faces in the frame
+        faces = self.detector.detect_faces(frame)
+        
+        # 2. Blur faces (Passing 'self.my_embedding' allows the exemption logic to run)
+        processed = self.blurrer.blur_faces(frame, faces, self.blur_enabled, self.my_embedding)
+        
+        # 3. Draw the HUD
+        processed = self._draw_hud(processed)
+        return processed
+
+
+    def _draw_hud(self, frame):
+        status_text = f"PRIVACY: {'ON' if self.blur_enabled else 'OFF'}"
+        font_scale = 1.0
+        thickness = 2
+        (text_w, text_h), _ = cv2.getTextSize(status_text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, thickness)
+        
+        # Draw Yellow Background
+        cv2.rectangle(frame, (10, 10), (10 + text_w + 20, 10 + text_h + 20), (0, 255, 255), -1)
+        # Draw Black Text
+        cv2.putText(frame, status_text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0), thickness)
+        return frame
+
+
+    def _handle_key(self, key: int) -> bool:
+        if key == ord('b'):
+            self.blur_enabled = not self.blur_enabled
+        if key == ord('q'):
+            return False
+        return True
+
+if __name__ == "__main__":
+    print("=========================================")
+    print("   FACE BLUR APP (RTX 3050 EDITION)    ")
+    print("=========================================")
+    print(f"Current Working Directory: {os.getcwd()}")
+    print("1. Live Vlogging (Webcam)")
+    print("2. Process Video File")
+    
+    choice = input("Select Input Source (1 or 2): ").strip()
+    
+    source = 0 
+    output_file = "output_vlog.mp4"
+
+    if choice == '2':
+        filename = input("Enter video filename (e.g., input.mp4): ").strip()
+        
+        # FIX: Clean quotes if user copied path as "path/to/file"
+        if filename.startswith('"') and filename.endswith('"'):
+            filename = filename[1:-1]
+            
+        # FIX: Strict check. If file is missing, exit. DO NOT open webcam.
+        if os.path.exists(filename):
+            source = filename
+            output_file = "processed_" + filename
+        else:
+            print("\n!!! ERROR: FILE NOT FOUND !!!")
+            print(f"Looking for: '{filename}'")
+            print(f"Inside folder: {os.getcwd()}")
+            print("Please check the name or provide the full path.")
+            print("Exiting app...")
+            sys.exit() # STOPS the program so you can see the error
+    
+    print(f"Starting processor... Output will be saved to: {output_file}")
+    
+    # Initialize and Run
+    app = BlurApp(source, output_file)
+    app.run()
